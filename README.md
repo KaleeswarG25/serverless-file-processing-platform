@@ -383,7 +383,7 @@ The project has been deployed to AWS and a sample CSV upload has successfully pr
 
 ## S3 Reports
 
-![S3 Reports](docs/s3_reports.png)
+![S3 Reports](docs/s3_report.png)
 
 ## Author
 
