@@ -1,0 +1,408 @@
+locals {
+  name = "${var.project_name}-${var.environment}-${var.name_suffix}"
+}
+
+
+data "aws_caller_identity" "current" {}
+
+data "aws_region" "current" {}
+
+data "archive_file" "lambda" {
+  type        = "zip"
+  source_dir  = "${path.module}/.."
+  output_path = "${path.module}/lambda-package.zip"
+
+  excludes = [
+    ".git",
+    ".git/**",
+    ".venv",
+    ".venv/**",
+    "venv",
+    "venv/**",
+    "__pycache__",
+    "**/__pycache__/**",
+    "*.pyc",
+    "**/*.pyc",
+    "tests",
+    "tests/**",
+    "sample-data",
+    "sample-data/**",
+    "output",
+    "output/**",
+    "scripts",
+    "scripts/**",
+    "docs",
+    "docs/**",
+    "terraform",
+    "terraform/**",
+    ".pytest_cache",
+    ".pytest_cache/**",
+    ".ruff_cache",
+    ".ruff_cache/**"
+  ]
+}
+
+# --------------------------------------------------
+# S3 bucket
+# --------------------------------------------------
+
+resource "aws_s3_bucket" "files" {
+  bucket        = "${local.name}-files"
+  force_destroy = true
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "files" {
+  bucket = aws_s3_bucket.files.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "files" {
+  bucket = aws_s3_bucket.files.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "files" {
+  bucket = aws_s3_bucket.files.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# --------------------------------------------------
+# SQS dead-letter queue
+# --------------------------------------------------
+
+resource "aws_sqs_queue" "dlq" {
+  name                      = "${local.name}-dlq"
+  message_retention_seconds = 1209600
+  sqs_managed_sse_enabled   = true
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+# --------------------------------------------------
+# SQS processing queue
+# --------------------------------------------------
+
+resource "aws_sqs_queue" "processing" {
+  name                       = "${local.name}-processing"
+  visibility_timeout_seconds = var.lambda_timeout_seconds * 6
+  message_retention_seconds  = 345600
+  receive_wait_time_seconds  = 10
+  sqs_managed_sse_enabled    = true
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.dlq.arn
+    maxReceiveCount     = 3
+  })
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+resource "aws_sqs_queue_redrive_allow_policy" "dlq" {
+  queue_url = aws_sqs_queue.dlq.id
+
+  redrive_allow_policy = jsonencode({
+    redrivePermission = "byQueue"
+    sourceQueueArns   = [aws_sqs_queue.processing.arn]
+  })
+}
+
+# --------------------------------------------------
+# CloudWatch logs
+# --------------------------------------------------
+
+resource "aws_cloudwatch_log_group" "lambda" {
+  name              = "/aws/lambda/${local.name}-processor"
+  retention_in_days = var.log_retention_days
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+# --------------------------------------------------
+# Lambda IAM role
+# --------------------------------------------------
+
+resource "aws_iam_role" "lambda" {
+  name = "${local.name}-lambda-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "LambdaAssumeRole"
+        Effect = "Allow"
+
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_basic" {
+  role       = aws_iam_role.lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# --------------------------------------------------
+# Lambda least-privilege access policy
+# --------------------------------------------------
+
+resource "aws_iam_role_policy" "access" {
+  name = "${local.name}-access-policy"
+  role = aws_iam_role.lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+
+    Statement = [
+      {
+        Sid    = "ReadUploadedCsvFiles"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectVersion"
+        ]
+        Resource = "${aws_s3_bucket.files.arn}/uploads/*"
+      },
+      {
+        Sid    = "WriteProcessingReports"
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject"
+        ]
+        Resource = "${aws_s3_bucket.files.arn}/reports/*"
+      },
+      {
+        Sid    = "CheckExistingReports"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject"
+        ]
+        Resource = "${aws_s3_bucket.files.arn}/reports/*"
+      },
+      {
+        # Needed so S3 can return 404 for a missing object
+        # instead of 403 when checking for existing reports.
+        Sid    = "ListBucketForMissingObjectChecks"
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket"
+        ]
+        Resource = aws_s3_bucket.files.arn
+      },
+      {
+        Sid    = "ConsumeProcessingQueue"
+        Effect = "Allow"
+        Action = [
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes",
+          "sqs:ChangeMessageVisibility"
+        ]
+        Resource = aws_sqs_queue.processing.arn
+      }
+    ]
+  })
+}
+
+# --------------------------------------------------
+# Lambda function
+# --------------------------------------------------
+
+resource "aws_lambda_function" "processor" {
+  function_name = "${local.name}-processor"
+  description   = "Validates and analyzes uploaded CSV files"
+  role          = aws_iam_role.lambda.arn
+
+  runtime = "python3.12"
+  handler = "src.handler.lambda_handler"
+
+  filename         = data.archive_file.lambda.output_path
+  source_code_hash = data.archive_file.lambda.output_base64sha256
+
+  timeout     = var.lambda_timeout_seconds
+  memory_size = 512
+
+  environment {
+    variables = {
+      BUCKET_NAME      = aws_s3_bucket.files.bucket
+      MAX_FILE_SIZE_MB = "10"
+    }
+  }
+
+  depends_on = [
+    aws_cloudwatch_log_group.lambda,
+    aws_iam_role_policy.access,
+    aws_iam_role_policy_attachment.lambda_basic
+  ]
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+# --------------------------------------------------
+# SQS → Lambda event source mapping
+# --------------------------------------------------
+
+resource "aws_lambda_event_source_mapping" "processing" {
+  event_source_arn = aws_sqs_queue.processing.arn
+  function_name    = aws_lambda_function.processor.arn
+
+  batch_size              = 5
+  function_response_types = ["ReportBatchItemFailures"]
+  enabled                 = true
+}
+
+# --------------------------------------------------
+# Allow S3 to send upload notifications to SQS
+# --------------------------------------------------
+
+resource "aws_sqs_queue_policy" "allow_s3" {
+  queue_url = aws_sqs_queue.processing.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+
+    Statement = [
+      {
+        Sid    = "AllowS3SendMessages"
+        Effect = "Allow"
+        Principal = {
+          Service = "s3.amazonaws.com"
+        }
+
+        Action   = "sqs:SendMessage"
+        Resource = aws_sqs_queue.processing.arn
+
+        Condition = {
+          ArnEquals = {
+            "aws:SourceArn" = aws_s3_bucket.files.arn
+          }
+
+          StringEquals = {
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      }
+    ]
+  })
+}
+
+# --------------------------------------------------
+# S3 → SQS event notification
+# --------------------------------------------------
+
+resource "aws_s3_bucket_notification" "uploads" {
+  bucket = aws_s3_bucket.files.id
+
+  queue {
+    queue_arn     = aws_sqs_queue.processing.arn
+    events        = ["s3:ObjectCreated:*"]
+    filter_prefix = "uploads/"
+  }
+
+  depends_on = [
+    aws_sqs_queue_policy.allow_s3
+  ]
+}
+
+# --------------------------------------------------
+# CloudWatch alarm for Lambda errors
+# --------------------------------------------------
+
+resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
+  alarm_name          = "${local.name}-lambda-errors"
+  alarm_description   = "Alerts when the CSV processing Lambda reports errors"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = 300
+  statistic           = "Sum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+
+  dimensions = {
+    FunctionName = aws_lambda_function.processor.function_name
+  }
+
+  tags = {
+    Project     = var.project_name
+    Environment = var.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+# --------------------------------------------------
+# Enforce HTTPS for S3 requests
+# --------------------------------------------------
+
+resource "aws_s3_bucket_policy" "require_tls" {
+  bucket = aws_s3_bucket.files.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+
+    Statement = [
+      {
+        Sid       = "DenyInsecureTransport"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "s3:*"
+
+        Resource = [
+          aws_s3_bucket.files.arn,
+          "${aws_s3_bucket.files.arn}/*"
+        ]
+
+        Condition = {
+          Bool = {
+            "aws:SecureTransport" = "false"
+          }
+        }
+      }
+    ]
+  })
+}

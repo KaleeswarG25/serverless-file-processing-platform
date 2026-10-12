@@ -1,0 +1,7 @@
+order_id,product,quantity,unit_price,region
+ORD101,Laptop,2,50000,South
+ORD102,Mouse,-5,500,North
+ORD103,Keyboard,abc,1500,South
+ORD104,,2,12000,West
+ORD101,Laptop,1,50000,South
+ORD105,Headphones,4,-200,North
