@@ -377,7 +377,13 @@ Potential extensions include:
 
 The project has been deployed to AWS and a sample CSV upload has successfully produced report artifacts in S3.
 
-The repository's current automated test suite has also passed in the local development environment.
+## Lamda Logs
+
+![Lamda Logs](docs/lamda_logs.png)
+
+## S3 Reports
+
+![S3 Reports](docs/s3_reports.png)
 
 ## Author
 
